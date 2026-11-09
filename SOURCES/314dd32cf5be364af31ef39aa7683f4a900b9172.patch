@@ -1,0 +1,181 @@
+From 314dd32cf5be364af31ef39aa7683f4a900b9172 Mon Sep 17 00:00:00 2001
+From: Jason Jerome <jajerome@redhat.com>
+Date: Wed, 28 Oct 2026 13:44:02 -0400
+Subject: [PATCH] fix: path traversal in repo file handling via unsanitized
+ repo name
+
+canonicalizeRepoName now rejects repository names that are not a single
+safe path component (empty, ".", "..", absolute, or containing a path
+separator), preventing AddRepo/RemoveRepo from writing or deleting files
+outside /etc/yum.repos.d/.
+
+CVE: CVE-2026-18379
+Upstream Status: Embargoed
+Resolves: RHEL-276911
+
+Signed-off-by: Jason Jerome <jajerome@redhat.com>
+---
+ package_manager_dnf.go | 12 ++++++++++--
+ package_manager_yum.go | 12 ++++++++++--
+ util.go                | 28 ++++++++++++++++++++++++++--
+ util_test.go           | 42 ++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 88 insertions(+), 6 deletions(-)
+ create mode 100644 util_test.go
+
+diff --git a/package_manager_dnf.go b/package_manager_dnf.go
+index 0651426..fe90f5c 100644
+--- a/package_manager_dnf.go
++++ b/package_manager_dnf.go
+@@ -23,16 +23,24 @@ func (p *PackageManagerDnf) AddRepo(
+ 	name string,
+ 	content []byte,
+ ) (stdout, stderr []byte, code int, err error) {
++	repoName, err := canonicalizeRepoName(name, ".repo")
++	if err != nil {
++		return nil, nil, -1, err
++	}
+ 	return nil, nil, -1, os.WriteFile(
+-		filepath.Join("/etc/yum.repos.d/", canonicalizeRepoName(name, ".repo")),
++		filepath.Join("/etc/yum.repos.d/", repoName),
+ 		content,
+ 		0644,
+ 	)
+ }
+ 
+ func (p *PackageManagerDnf) RemoveRepo(name string) (stdout, stderr []byte, code int, err error) {
++	repoName, err := canonicalizeRepoName(name, ".repo")
++	if err != nil {
++		return nil, nil, -1, err
++	}
+ 	return nil, nil, -1, os.Remove(
+-		filepath.Join("/etc/yum.repos.d/", canonicalizeRepoName(name, ".repo")),
++		filepath.Join("/etc/yum.repos.d/", repoName),
+ 	)
+ }
+ 
+diff --git a/package_manager_yum.go b/package_manager_yum.go
+index 6c301d7..c43e413 100644
+--- a/package_manager_yum.go
++++ b/package_manager_yum.go
+@@ -23,16 +23,24 @@ func (p *PackageManagerYum) AddRepo(
+ 	name string,
+ 	content []byte,
+ ) (stdout, stderr []byte, code int, err error) {
++	repoName, err := canonicalizeRepoName(name, ".repo")
++	if err != nil {
++		return nil, nil, -1, err
++	}
+ 	return nil, nil, -1, os.WriteFile(
+-		filepath.Join("/etc/yum.repos.d/", canonicalizeRepoName(name, ".repo")),
++		filepath.Join("/etc/yum.repos.d/", repoName),
+ 		content,
+ 		0644,
+ 	)
+ }
+ 
+ func (p *PackageManagerYum) RemoveRepo(name string) (stdout, stderr []byte, code int, err error) {
++	repoName, err := canonicalizeRepoName(name, ".repo")
++	if err != nil {
++		return nil, nil, -1, err
++	}
+ 	return nil, nil, -1, os.Remove(
+-		filepath.Join("/etc/yum.repos.d/", canonicalizeRepoName(name, ".repo")),
++		filepath.Join("/etc/yum.repos.d/", repoName),
+ 	)
+ }
+ 
+diff --git a/util.go b/util.go
+index 423fdc7..1884107 100644
+--- a/util.go
++++ b/util.go
+@@ -4,13 +4,37 @@ import (
+ 	"bufio"
+ 	"fmt"
+ 	"os"
++	"path/filepath"
+ 	"strings"
+ )
+ 
+ // canonicalizeRepoName converts the string filename into a suitable filename.
+ // It replaces all spaces with underscores and appends the given suffix.
+-func canonicalizeRepoName(filename, suffix string) string {
+-	return strings.TrimSuffix(strings.ReplaceAll(filename, " ", "_"), suffix) + suffix
++//
++// The returned name is always a single path component: filename must not
++// contain a path separator or a ".." element, must not be absolute, and must
++// not be empty. This prevents a caller from using the result to escape its
++// intended directory (path traversal). An error is returned if filename is not
++// a valid repository name.
++func canonicalizeRepoName(filename, suffix string) (string, error) {
++	// Validate the raw input before it is transformed: reject empty names,
++	// absolute paths, "." and ".." elements, and anything containing a path
++	// separator so the result cannot escape its intended directory.
++	if filename == "" || filename == "." || filename == ".." ||
++		filepath.IsAbs(filename) || strings.ContainsRune(filename, '/') ||
++		strings.ContainsRune(filename, filepath.Separator) {
++		return "", fmt.Errorf("invalid repository name: %q", filename)
++	}
++
++	name := strings.TrimSuffix(strings.ReplaceAll(filename, " ", "_"), suffix) + suffix
++
++	// Defense-in-depth: ensure the canonicalized name is still a single path
++	// component after transformation.
++	if filepath.Base(name) != name {
++		return "", fmt.Errorf("invalid repository name: %q", filename)
++	}
++
++	return name, nil
+ }
+ 
+ // readLines reads each line in file into a slice.
+diff --git a/util_test.go b/util_test.go
+new file mode 100644
+index 0000000..25ca38b
+--- /dev/null
++++ b/util_test.go
+@@ -0,0 +1,42 @@
++package main
++
++import "testing"
++
++func TestCanonicalizeRepoName(t *testing.T) {
++	tests := []struct {
++		name    string
++		input   string
++		want    string
++		wantErr bool
++	}{
++		{name: "simple name", input: "epel", want: "epel.repo"},
++		{name: "name with spaces", input: "my repo", want: "my_repo.repo"},
++		{name: "existing suffix is not doubled", input: "foo.repo", want: "foo.repo"},
++		{name: "parent traversal", input: "../../etc/cron.d/foo", wantErr: true},
++		{name: "deep traversal", input: "../../../tmp/foo", wantErr: true},
++		{name: "absolute path", input: "/foo/bar", wantErr: true},
++		{name: "embedded separator", input: "foo/bar", wantErr: true},
++		{name: "absolute path with repo", input: "/etc/yum.repos.d/foo.repo", wantErr: true},
++		{name: "double dot", input: "..", wantErr: true},
++		{name: "single dot", input: ".", wantErr: true},
++		{name: "empty name", input: "", wantErr: true},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := canonicalizeRepoName(tt.input, ".repo")
++			if tt.wantErr {
++				if err == nil {
++					t.Fatalf("canonicalizeRepoName(%q) = %q, want error", tt.input, got)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("canonicalizeRepoName(%q) unexpected error: %v", tt.input, err)
++			}
++			if got != tt.want {
++				t.Errorf("canonicalizeRepoName(%q) = %q, want %q", tt.input, got, tt.want)
++			}
++		})
++	}
++}
+-- 
+2.56.0
+
